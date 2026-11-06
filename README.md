@@ -290,13 +290,13 @@ requirements.txt              # pip fallback
 
 ```bibtex
 @inproceedings{ju2026pitchcontour,
-  title     = {Pitch Contour Tokenization using {VQ-VAE} and Its Application
-               on Korean Traditional Music Analysis},
-  author    = {Ju, Seonguk and Cho, Seola and Chung, Suin and
-               Han, Danbinaerin and Jeong, Dasaem},
-  booktitle = {Proceedings of the 27th International Society for Music
-               Information Retrieval Conference (ISMIR)},
-  year      = {2026},
+  title         = {Pitch Contour Tokenization using {VQ-VAE} and Its Application on Korean Traditional Music Analysis},
+  author        = {Ju, Seonguk and Cho, Seola and Chung, Suin and Han, Danbinaerin and Jeong, Dasaem},
+  booktitle     = {Proceedings of the 27th International Society for Music Information Retrieval Conference (ISMIR)},
+  year          = {2026},
+  eprint        = {2608.10979},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.SD}
 }
 ```
 
