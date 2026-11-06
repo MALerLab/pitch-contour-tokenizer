@@ -6,12 +6,10 @@ params:
   separate: true
 
   offset_params:
-    tempo_sr: [50, 54, 60]
-    zoom_ratio: [0.85, 1.0, 1.15]
+    tempo_sr: [50, 52, 55, 58, 60]
+    zoom_ratio: [0.9, 0.95, 1.0, 1.05, 1.1]
     y_offset: [-0.1, 0.0, 0.1]
-    step: 1
 
-  median_field: ${model.params.receptive_field}
   use_gradual_size: false
   num_layers: 6
 
@@ -24,4 +22,3 @@ params:
   beta: 2.0
   init: kmeans
   ortho_reg: 0.0
-  use_simvq: False

@@ -37,7 +37,7 @@ def main():
 
     n_plotted, rows, w_idx = 0, [], 0
     with torch.inference_mode():
-        for x, weight, meta in loader:
+        for x, weight in loader:   # weight slot = bool mask of interpolated frames
             x = x.to(device)
             out = model(x)
             if 'VQ' in model.__class__.__name__:

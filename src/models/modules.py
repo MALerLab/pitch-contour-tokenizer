@@ -1,12 +1,16 @@
-from typing import Tuple
+from typing import Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from omegaconf.dictconfig import DictConfig
+from omegaconf.listconfig import ListConfig
 
 from utils.model_utils import calc_conv_params
 from losses.loss_zoo import VectorQuantizeLoss
+
+
+
 
 class Conv1DBlock(nn.Module):
    def __init__(self, 
@@ -247,6 +251,3 @@ class VectorQuantizer(nn.Module):
         z_q = z + (z_q - z).detach()
 
         return z_q, (loss, codebook_loss, commitment_loss, ortho_loss), min_e
-
-
-

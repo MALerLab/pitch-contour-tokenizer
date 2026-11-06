@@ -4,6 +4,7 @@ from pathlib import Path
 import wandb
 from tqdm import tqdm
 from omegaconf.dictconfig import DictConfig
+from omegaconf.listconfig import ListConfig
 
 import torch
 import torch.nn as nn
@@ -15,6 +16,11 @@ from io import BytesIO
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
+
+from metrics.metric_zoo import *
+from datasets.dataset_zoo import *
+from utils.infer_utils import get_model, get_min_offset_contour
 
 
 class BaseTrainer:
@@ -93,7 +99,7 @@ class AETrainer(BaseTrainer):
         super().__init__(model, optimizer, scheduler, trainset, validset, criterion, metric, device, save_dir, config)
 
 
-    def get_plot_image(self, b_idx, target_contour, pred_contour, z):
+    def get_plot_image(self, b_idx, target_contour, pred_contour, z, target_mask=None):
         title = f'Step {self.global_step}'
 
         vq = False
@@ -103,7 +109,8 @@ class AETrainer(BaseTrainer):
             z, zq = z
 
         median_seq = []
-        median = self.model.subtract_median_from_x(target_contour[b_idx].unsqueeze(0))[1].squeeze().numpy()
+        b_mask = target_mask[b_idx].unsqueeze(0) if target_mask is not None else None
+        median = self.model.subtract_median_from_x(target_contour[b_idx].unsqueeze(0), mask=b_mask)[1].squeeze().numpy()
         if target_contour[b_idx].shape[-1] // self.model.rf == 1:
             median_seq += [median]*target_contour[b_idx].shape[-1]
         else:
@@ -111,7 +118,10 @@ class AETrainer(BaseTrainer):
                 median_seq += [m]*self.model.rf
 
         fig = plt.figure(figsize=(20, 10))
-        plt.plot(target_contour[b_idx,0], label='org')
+        tgt = target_contour[b_idx,0]
+        if target_mask is not None:
+            tgt = tgt.masked_fill(target_mask[b_idx,0].bool(), float('nan')) # pad frame은 rec과 동일하게 선 끊김
+        plt.plot(tgt, label='org')
         plt.plot(pred_contour[b_idx,0], label='rec')
         plt.plot(median_seq, label='med', alpha=0.5)
 
@@ -126,7 +136,7 @@ class AETrainer(BaseTrainer):
 
         plt.title(title)
         plt.xlabel('Time frame(10ms)')
-        plt.ylabel(f'Freq(normed with tonic)')
+        plt.ylabel('MIDI/12')
         plt.legend()
         plt.tight_layout()
 
@@ -143,8 +153,6 @@ class AETrainer(BaseTrainer):
 
 
     def _eval_samples(self):
-        if not self.config.wandb.get('project'):
-            return
         samples = torch.stack([s[0] for s in self.samples]).to(self.device)
         weights = torch.stack([s[1] for s in self.samples]).to(self.device)
 
@@ -154,35 +162,34 @@ class AETrainer(BaseTrainer):
                 target, pred, _ = self.model(torch.cat([samples, weights], dim=-2))
                 target_contour, pred_contour = target[0][:,0].unsqueeze(-2), pred[0][:,0].unsqueeze(-2)
             else:
-                target, pred, _ = self.model(samples)
+                mask = weights if self.criterion.use_weight else None # 학습 스텝과 동일 조건으로 mask 전달 (median 계산 일치)
+                target, pred, _ = self.model(samples, mask=mask)
                 target_contour, pred_contour= target, pred
             z = (target[-1].detach().cpu(),pred[-1].detach().cpu())
 
         if pred_contour.size() != target_contour.size():
-            b,c,r,t = pred_contour.shape
-            pr = pred_contour.reshape(b,c,r,t//self.model.rf,self.model.rf)
-            tr = target_contour.unsqueeze(-2).reshape(b,c,1,t//self.model.rf,self.model.rf)
-            squared_errors = torch.pow(pr-tr, 2) # b,c_in,rolled_size,t_comp,rf
-
-            if self.criterion.use_weight:
-                weight = weights.unsqueeze(-2).unsqueeze(-2).reshape(b,c,1,t//self.model.rf,self.model.rf)
-                sqe = torch.sum(squared_errors * weight, dim=-1) / torch.sum(weight, dim=-1)
-            else:
-                sqe = torch.mean(squared_errors, dim=-1)
-
-            min_ids = torch.argmin(sqe, dim=-2).unsqueeze(-2).unsqueeze(-1).expand(-1,-1,-1,-1,self.model.rf)
-            pred_contour = pr.gather(dim=-3, index=min_ids).squeeze().reshape(b,c,-1)
+            # loss와 동일 기준(mask 제외 frame의 오차)으로 offset 후보 선택 — infer_utils 공용 구현 재사용
+            pred_contour = get_min_offset_contour(pred_contour, target_contour, self.model.rf,
+                                                  weights if self.criterion.use_weight else None)
 
         target_contour, pred_contour = target_contour.detach().cpu(), pred_contour.detach().cpu()
+
+        # dataset 공통 계약: weight 자리 = bool mask (True=제외 frame) — mask frame은 nan으로 plot에서 선 끊김
+        tgt_mask = weights.detach().cpu().bool()
+        pred_contour = pred_contour.masked_fill(tgt_mask, float('nan'))
 
         img = []
         vis_log = {}
         for b_idx in range(samples.shape[0]):
-            image_np = self.get_plot_image(b_idx, target_contour, pred_contour, z)
+            image_np = self.get_plot_image(b_idx, target_contour, pred_contour, z, target_mask=tgt_mask)
             img.append(image_np)
             vis_log[f"Vis/Sample{b_idx}"] = wandb.Image(Image.fromarray(image_np))
         wandb.log(vis_log, step=self.global_step)
-
+        # img = []
+        # for b_idx in range(samples.shape[0]):
+        #     image_np = self.get_plot_image(b_idx, target_contour, pred_contour, z)
+        #     img.append(image_np)
+        #     wandb.log({f"Vis/Sample{b_idx}": wandb.Image(Image.fromarray(image_np))}, step=self.global_step)
 
 
     def _calc_metric(self,
@@ -203,13 +210,27 @@ class AETrainer(BaseTrainer):
             self.recorder[f'{phase}'][f'{phase}/{metric_name}'] = metric_value.item()
 
 
+    def _calc_additive_loss(self,
+                            target: torch.Tensor,
+                            pred: torch.Tensor,
+                            loss: torch.Tensor,
+                            phase: str='Train') -> torch.Tensor:
+        target_contour, pred_contour = target, pred
+
+        if self.config.train.additive_loss.perceptual.get('weight', False):
+            perceptual_loss = self.calc_perceptual_loss(target_contour, pred_contour)
+            self.recorder[f'{phase}'][f'{phase}/PerceptualLoss'] = perceptual_loss.item()
+            loss += self.config.train.additive_loss.perceptual.weight * perceptual_loss
+
+        return loss
+
+
     def _step_multi_channel_batch(self):
         raise NotImplementedError("Subclasses must implement this method")
 
     def _step_single_channel_batch(self,
                                     x: torch.Tensor,
                                     weight: torch.Tensor,
-                                    meta: Tuple[torch.Tensor],
                                     phase: str='Train') -> Tuple[torch.Tensor]:
         target, pred, z = self.model(x) if not self.criterion.use_weight else self.model(x, mask=weight)
         recon_loss = self.criterion(pred, target, weight=weight)
@@ -225,13 +246,15 @@ class AETrainer(BaseTrainer):
                      batch: Tuple[torch.Tensor]) -> float:
         self.recorder['Train'] = {}
         self.model.train()
-        x, weight, meta = batch
+        x, weight = batch
         x, weight = x.to(self.device, non_blocking=True), weight.to(self.device, non_blocking=True)
 
         if self.model.hparams.in_channels != 1:
-            target, pred, loss = self._step_multi_channel_batch(x, weight, meta, phase='Train')
+            target, pred, loss = self._step_multi_channel_batch(x, weight, phase='Train')
         else:
-            target, pred, loss = self._step_single_channel_batch(x, weight, meta, phase='Train')
+            target, pred, loss = self._step_single_channel_batch(x, weight, phase='Train')
+
+        loss = self._calc_additive_loss(target, pred, loss, phase='Train')
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -286,24 +309,32 @@ class AETrainer(BaseTrainer):
 
         self.model.eval()
         data_loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
+            # data_loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False,
+            #                          num_workers=4, pin_memory=True)
 
         total_loss, total_recon_loss = 0, 0
+        total_perceptual_loss = 0 if self.config.train.additive_loss.perceptual.get('weight', False) else None
         total_metrics = [0 for _ in range(len(self.metric))] if self.metric else None
 
         with torch.inference_mode():
             for batch in data_loader:
-                x, weight, meta = batch
+                x, weight = batch
+                # x, weight = x.to(self.device, non_blocking=True), weight.to(self.device, non_blocking=True)
                 x, weight = x.to(self.device), weight.to(self.device)
 
                 if self.model.hparams.in_channels != 1:
-                    target, pred, loss = self._step_multi_channel_batch(x, weight, meta, phase=phase)
+                    target, pred, loss = self._step_multi_channel_batch(x, weight, phase=phase)
                 else:
-                    target, pred, loss = self._step_single_channel_batch(x, weight, meta, phase=phase)
+                    target, pred, loss = self._step_single_channel_batch(x, weight, phase=phase)
 
+                loss = self._calc_additive_loss(target, pred, loss, phase='Valid')
                 self._calc_metric(target, pred, phase=phase)
 
                 total_loss += loss.item() * x.shape[0]
                 total_recon_loss += self.recorder[f'{phase}'][f'{phase}/ReconLoss'] * x.shape[0]
+
+                if total_perceptual_loss is not None:
+                    total_perceptual_loss += self.recorder[f'{phase}'][f'{phase}/PerceptualLoss'] * x.shape[0]
 
                 if total_metrics is not None:
                     for i, m in enumerate(self.metric):
@@ -311,6 +342,9 @@ class AETrainer(BaseTrainer):
 
         self.recorder[f'{phase}'][f'{phase}/Loss'] = total_loss / len(dataset)
         self.recorder[f'{phase}'][f'{phase}/ReconLoss'] = total_recon_loss / len(dataset)
+
+        if total_perceptual_loss is not None:
+            self.recorder[f'{phase}'][f'{phase}/PerceptualLoss'] = total_perceptual_loss / len(dataset)
 
         if total_metrics is not None:
             for i, m in enumerate(self.metric):
@@ -351,7 +385,7 @@ class VQTrainer(BaseTrainer):
         super().__init__(model, optimizer, scheduler, trainset, validset, criterion, metric, device, save_dir, config)
 
 
-    def get_plot_image(self, b_idx, target_contour, pred_contour, z):
+    def get_plot_image(self, b_idx, target_contour, pred_contour, z, target_mask=None):
         title = f'Step {self.global_step}'
 
         vq = False
@@ -361,7 +395,8 @@ class VQTrainer(BaseTrainer):
             z, zq = z
 
         median_seq = []
-        median = self.model.subtract_median_from_x(target_contour[b_idx].unsqueeze(0))[1].squeeze().numpy()
+        b_mask = target_mask[b_idx].unsqueeze(0) if target_mask is not None else None
+        median = self.model.subtract_median_from_x(target_contour[b_idx].unsqueeze(0), mask=b_mask)[1].squeeze().numpy()
         if target_contour[b_idx].shape[-1] // self.model.rf == 1:
             median_seq += [median]*target_contour[b_idx].shape[-1]
         else:
@@ -369,7 +404,10 @@ class VQTrainer(BaseTrainer):
                 median_seq += [m]*self.model.rf
 
         fig = plt.figure(figsize=(20, 10))
-        plt.plot(target_contour[b_idx,0], label='org')
+        tgt = target_contour[b_idx,0]
+        if target_mask is not None:
+            tgt = tgt.masked_fill(target_mask[b_idx,0].bool(), float('nan')) # pad frame은 rec과 동일하게 선 끊김
+        plt.plot(tgt, label='org')
         plt.plot(pred_contour[b_idx,0], label='rec')
         plt.plot(median_seq, label='med', alpha=0.5)
 
@@ -384,7 +422,7 @@ class VQTrainer(BaseTrainer):
 
         plt.title(title)
         plt.xlabel('Time frame(10ms)')
-        plt.ylabel(f'Freq(normed with tonic)')
+        plt.ylabel('MIDI/12')
         plt.legend()
         plt.tight_layout()
 
@@ -401,8 +439,6 @@ class VQTrainer(BaseTrainer):
 
 
     def _eval_samples(self):
-        if not self.config.wandb.get('project'):
-            return
         samples = torch.stack([s[0] for s in self.samples]).to(self.device)
         weights = torch.stack([s[1] for s in self.samples]).to(self.device)
 
@@ -412,34 +448,34 @@ class VQTrainer(BaseTrainer):
                 target, pred, _, _ = self.model(torch.cat([samples, weights], dim=-2))
                 target_contour, pred_contour = target[0][:,0].unsqueeze(-2), pred[0][:,0].unsqueeze(-2)
             else:
-                target, pred, _, _ = self.model(samples)
+                mask = weights if self.criterion.use_weight else None # 학습 스텝과 동일 조건으로 mask 전달 (median 계산 일치)
+                target, pred, _, _ = self.model(samples, mask=mask)
                 target_contour, pred_contour= target[0], pred[0]
             z = (target[-1].detach().cpu(),pred[-1].detach().cpu())
 
         if pred_contour.size() != target_contour.size():
-            b,c,r,t = pred_contour.shape
-            pr = pred_contour.reshape(b,c,r,t//self.model.rf,self.model.rf)
-            tr = target_contour.unsqueeze(-2).reshape(b,c,1,t//self.model.rf,self.model.rf)
-            squared_errors = torch.pow(pr-tr, 2) # b,c_in,rolled_size,t_comp,rf
-
-            if self.criterion.use_weight:
-                weight = weights.unsqueeze(-2).unsqueeze(-2).reshape(b,c,1,t//self.model.rf,self.model.rf)
-                sqe = torch.sum(squared_errors * weight, dim=-1) / torch.sum(weight, dim=-1)
-            else:
-                sqe = torch.mean(squared_errors, dim=-1)
-
-            min_ids = torch.argmin(sqe, dim=-2).unsqueeze(-2).unsqueeze(-1).expand(-1,-1,-1,-1,self.model.rf)
-            pred_contour = pr.gather(dim=-3, index=min_ids).squeeze().reshape(b,c,-1)
+            # loss와 동일 기준(mask 제외 frame의 오차)으로 offset 후보 선택 — infer_utils 공용 구현 재사용
+            pred_contour = get_min_offset_contour(pred_contour, target_contour, self.model.rf,
+                                                  weights if self.criterion.use_weight else None)
 
         target_contour, pred_contour = target_contour.detach().cpu(), pred_contour.detach().cpu()
+
+        # dataset 공통 계약: weight 자리 = bool mask (True=제외 frame) — mask frame은 nan으로 plot에서 선 끊김
+        tgt_mask = weights.detach().cpu().bool()
+        pred_contour = pred_contour.masked_fill(tgt_mask, float('nan'))
 
         img = []
         vis_log = {}
         for b_idx in range(samples.shape[0]):
-            image_np = self.get_plot_image(b_idx, target_contour, pred_contour, z)
+            image_np = self.get_plot_image(b_idx, target_contour, pred_contour, z, target_mask=tgt_mask)
             img.append(image_np)
             vis_log[f"Vis/Sample{b_idx}"] = wandb.Image(Image.fromarray(image_np))
         wandb.log(vis_log, step=self.global_step)
+        # img = []
+        # for b_idx in range(samples.shape[0]):
+        #     image_np = self.get_plot_image(b_idx, target_contour, pred_contour, z)
+        #     img.append(image_np)
+        #     wandb.log({f"Vis/Sample{b_idx}": wandb.Image(Image.fromarray(image_np))}, step=self.global_step)
 
 
     def _calc_metric(self,
@@ -459,10 +495,54 @@ class VQTrainer(BaseTrainer):
             self.recorder[f'{phase}'][f'{phase}/{metric_name}'] = metric_value.item()
 
 
+    def calc_perceptual_loss(self, 
+                            target_contour: torch.Tensor, 
+                            pred_contour: torch.Tensor) -> torch.Tensor:
+        perceptual_loss = 0
+
+        if getattr(self, 'classifier', None) is None:
+            self.classifier = get_model(self.config.train.perceptual_loss.pretrained_classifier).to(self.device)
+            self.classifier.return_latent = self.config.train.perceptual_loss.return_latent
+
+        self.classifier.eval()
+        with torch.inference_mode():
+            try:
+                if self.model.hparams.in_channels == 2:
+                    _, target_embed = self.classifier(target_contour[:,0].unsqueeze(-2).to(self.device))
+                    _, pred_embed = self.classifier(pred_contour[:,0].unsqueeze(-2).to(self.device))
+                else:
+                    _, target_embed = self.classifier(target_contour.to(self.device))
+                    _, pred_embed = self.classifier(pred_contour.to(self.device))
+            except:
+                raise ValueError(f"Unknown return_latent: {self.classifier.return_latent}")
+
+        if isinstance(self.classifier.return_latent, (list, ListConfig)):
+            perceptual_loss = sum([self.criterion(pred_e, target_e, weight=None) for pred_e, target_e in zip(pred_embed, target_embed)])
+
+        elif isinstance(self.classifier.return_latent, int):
+            perceptual_loss = self.criterion(pred_embed, target_embed, weight=None)
+
+        return perceptual_loss
+
+
+    def _calc_additive_loss(self,
+                            target: torch.Tensor,
+                            pred: torch.Tensor,
+                            loss: torch.Tensor,
+                            phase: str='Train') -> torch.Tensor:
+        target_contour, pred_contour = target[0], pred[0]
+
+        if self.config.train.additive_loss.perceptual.get('weight', False):
+            perceptual_loss = self.calc_perceptual_loss(target_contour, pred_contour)
+            self.recorder[f'{phase}'][f'{phase}/PerceptualLoss'] = perceptual_loss.item()
+            loss += self.config.train.additive_loss.perceptual.weight * perceptual_loss
+
+        return loss
+
+
     def _step_multi_channel_batch(self,
                                     x: torch.Tensor,
                                     weight: torch.Tensor,
-                                    meta: Tuple[torch.Tensor],
                                     phase: str='Train') -> Tuple[torch.Tensor]:
         raise NotImplementedError("No dataset type implemented")
 
@@ -470,7 +550,6 @@ class VQTrainer(BaseTrainer):
     def _step_single_channel_batch(self,
                                     x: torch.Tensor,
                                     weight: torch.Tensor,
-                                    meta: Tuple[torch.Tensor],
                                     phase: str='Train') -> Tuple[torch.Tensor]:
             target, pred, (vq_loss, _, _, ortho_loss), min_e = self.model(x) if not self.criterion.use_weight else self.model(x, mask=weight)
             recon_loss = self.criterion(pred, target, weight=weight)
@@ -492,16 +571,18 @@ class VQTrainer(BaseTrainer):
                      batch: Tuple[torch.Tensor]) -> float:
         self.recorder['Train'] = {}
         self.model.train()
-        x, weight, meta = batch
+        x, weight = batch
         x, weight = x.to(self.device, non_blocking=True), weight.to(self.device, non_blocking=True)
 
         with torch.autocast('cuda', dtype=self.amp_dtype, enabled=self.amp_enabled):
             if self.model.hparams.in_channels != 1:
-                target, pred, min_e, loss = self._step_multi_channel_batch(x, weight, meta, phase='Train')
+                target, pred, min_e, loss = self._step_multi_channel_batch(x, weight, phase='Train')
             else:
-                target, pred, min_e, loss = self._step_single_channel_batch(x, weight, meta, phase='Train')
+                target, pred, min_e, loss = self._step_single_channel_batch(x, weight, phase='Train')
 
-        (loss / self.accum_steps).backward()
+            loss = self._calc_additive_loss(target, pred, loss, phase='Train')
+
+        (loss / self.accum_steps).backward()        # backward는 autocast 밖 (bf16: GradScaler 불필요)
         self._micro += 1
         stepped = (self._micro % self.accum_steps==0)
 
@@ -561,24 +642,28 @@ class VQTrainer(BaseTrainer):
 
         self.model.eval()
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        eval_bs = self.config.train.get('eval_batch_size', self.batch_size)
+            torch.cuda.empty_cache()                                             # 학습 후 단편화 완화 (eval OOM 회피)
+        eval_bs = self.config.train.get('eval_batch_size', self.batch_size)      # eval 전용 batch (기본=train batch; 지표 불변)
+        # data_loader = DataLoader(dataset, batch_size=eval_bs, shuffle=False, num_workers=4, pin_memory=True)
         data_loader = DataLoader(dataset, batch_size=eval_bs, shuffle=False)
 
         total_loss, total_vq_loss, total_recon_loss = 0, 0, 0
         total_ortho_loss = 0 if self.model.quantizer.ortho_reg else None
+        total_perceptual_loss = 0 if self.config.train.additive_loss.perceptual.get('weight', False) else None
         total_metrics = [0 for _ in range(len(self.metric))]
 
         with torch.inference_mode():
             for batch in data_loader:
-                x, weight, meta = batch
+                x, weight = batch
+                # x, weight = x.to(self.device, non_blocking=True), weight.to(self.device, non_blocking=True)
                 x, weight = x.to(self.device), weight.to(self.device)
-            
-                if self.model.hparams.in_channels != 1:
-                    target, pred, min_e, loss = self._step_multi_channel_batch(x, weight, meta, phase=phase)
-                else:
-                    target, pred, min_e, loss = self._step_single_channel_batch(x, weight, meta, phase=phase)
 
+                if self.model.hparams.in_channels != 1:
+                    target, pred, min_e, loss = self._step_multi_channel_batch(x, weight, phase=phase)
+                else:
+                    target, pred, min_e, loss = self._step_single_channel_batch(x, weight, phase=phase)
+
+                loss = self._calc_additive_loss(target, pred, loss, phase='Valid')
                 self._calc_metric(target, pred, min_e, phase=phase)
 
                 total_loss += loss.item() * x.shape[0]
@@ -587,6 +672,9 @@ class VQTrainer(BaseTrainer):
 
                 if total_ortho_loss is not None:
                     total_ortho_loss += self.recorder[f'{phase}'][f'{phase}/OrthoLoss'] * x.shape[0]
+
+                if total_perceptual_loss is not None:
+                    total_perceptual_loss += self.recorder[f'{phase}'][f'{phase}/PerceptualLoss'] * x.shape[0]
 
                 for i, m in enumerate(self.metric):
                     total_metrics[i] += self.recorder[f'{phase}'][f'{phase}/{m.__class__.__name__}'] * x.shape[0]
@@ -598,6 +686,9 @@ class VQTrainer(BaseTrainer):
         if total_ortho_loss is not None:
             self.recorder[f'{phase}'][f'{phase}/OrthoLoss'] = total_ortho_loss / len(dataset)
 
+        if total_perceptual_loss is not None:
+            self.recorder[f'{phase}'][f'{phase}/PerceptualLoss'] = total_perceptual_loss / len(dataset)
+
         for i, m in enumerate(self.metric):
             self.recorder[f'{phase}'][f'{phase}/{m.__class__.__name__}'] = total_metrics[i] / len(dataset)
 
@@ -606,8 +697,9 @@ class VQTrainer(BaseTrainer):
             wandb.log(self.recorder[f'{phase}'], step=self.global_step)
             self.pbar.set_description(f"Iter {self.global_step}/{self.num_iterations} | Val Loss: {self.recorder[f'{phase}'][f'{phase}/ReconLoss']:.4f}")
             
+            # if valid_loss < self.best_score:
             if self.recorder[f'{phase}'][f'{phase}/ReconLoss'] < self.best_score:
-                self.best_score = self.recorder[f'{phase}'][f'{phase}/ReconLoss']
+                self.best_score = self.recorder[f'{phase}'][f'{phase}/ReconLoss'] # valid_loss
                 self.best_iteration = self.global_step
                 torch.save(self.model.state_dict(), self.save_dir/f'best_model.pt')
                 print(f"Iter {self.global_step}, Best Score {self.best_score:.4f}")
@@ -616,4 +708,3 @@ class VQTrainer(BaseTrainer):
             print(f"Test Loss: {self.recorder[f'{phase}'][f'{phase}/ReconLoss']:.4f}")
             wandb.log(self.recorder[f'{phase}'], step=self.global_step)
             wandb.summary["Test/Loss"] = self.recorder[f'{phase}'][f'{phase}/ReconLoss']
-

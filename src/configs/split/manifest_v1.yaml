@@ -1,0 +1,5 @@
+# The v1.0.0 paper split: random 8:1:1 over files (split_seed 42). Kept for reproducing the v1 checkpoints.
+name: manifest
+params:
+  manifest_pth: splits/inhouse_crepe_split.csv
+  with_test: True

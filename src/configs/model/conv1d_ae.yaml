@@ -5,7 +5,6 @@ params:
   in_channels: 1
   separate: true
 
-  median_field: ${model.params.receptive_field}
   use_gradual_size: false
   num_layers: 6
 

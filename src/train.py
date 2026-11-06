@@ -1,3 +1,5 @@
+import os
+from tqdm import tqdm
 from pathlib import Path
 from datetime import datetime
 
@@ -6,6 +8,7 @@ import wandb
 from omegaconf import OmegaConf
 
 import torch
+import numpy as np
 
 import trainers
 from losses import loss_zoo
@@ -20,31 +23,38 @@ T = datetime.now().strftime('%m%d_%H%M%S')
 DEV = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
+# @hydra.main(config_path="configs/vqvae")# , config_name="svqvae")
 @hydra.main(config_path="configs")
 def main(cfg):
     # Setup
     set_seed(cfg.random_seed)
     hparams = cfg.model.params
-    group_name = f"{cfg.model.get('name')}_{cfg.dataset.get('name')}_{cfg.loss.get('name')}__{hparams.get('receptive_field')}_{hparams.get('latent_dim')}_{hparams.get('num_layers')}__{hparams.get('num_codebooks')}_{hparams.get('beta')}"
-    run_name = f"{group_name}_{T}"
+    group_name = f"{cfg.model.get('name')}_{cfg.dataset.get('name')}_{cfg.loss.get('name')}__{hparams.get('receptive_field')}_{hparams.get('latent_dim')}_{hparams.get('num_layers')}__{hparams.get('offset_margin')}_{hparams.get('separate')}__{hparams.get('num_codebooks')}_{hparams.get('beta')}"
+    run_name = f"{cfg.wandb.get('notes', group_name)}_{T}"
 
     save_dir = Path(f"{cfg.dir.save_dir}/{run_name}")
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    if cfg.wandb.get('project'):
-        run = wandb.init(project=cfg.wandb.project,
-                         name=run_name,
-                         dir=str(save_dir),
-                         mode="online",
-                         group=group_name,
-                         notes=cfg.wandb.get('notes', None))
+    if cfg.wandb.get('project', False):
+        run = wandb.init(project=cfg.wandb.get('project'), 
+                    name=run_name, 
+                    dir=str(save_dir), 
+                    mode="online", 
+                    group=group_name,
+                    notes=cfg.wandb.get('notes', None))
     else:
         run = wandb.init(mode="disabled")
+
+    # for key, value in dict(wandb.config).items(): OmegaConf.update(cfg, key, value, merge=True)
+    # wandb.config.update(OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True))
+    # with open(save_dir/'config.yaml', 'w') as f: OmegaConf.save(cfg, f)
 
     for key, value in dict(wandb.config).items():
         OmegaConf.update(cfg, key, value, merge=True)
 
     _cfg_dict = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
+    _cfg_dict.get("data", {}).pop("nia_data_pth", None)   # strip scaffolding
+
     wandb.config.update(_cfg_dict)
     with open(save_dir / "config.yaml", "w") as f:
         OmegaConf.save(OmegaConf.create(_cfg_dict), f)
@@ -72,14 +82,15 @@ def main(cfg):
     model = model_class(hparams)
     model = model.to(DEV)
 
+    # MTG, Hindustani, Silecne processing
     if 'VQ' in model.__class__.__name__:
-        if model.hparams.init == 'uniform':
+        if model.hparams.init=='uniform':
             model.quantizer.init_embedding(init='uniform')
 
-        elif model.hparams.init == 'gaussian':
+        elif model.hparams.init=='gaussian':
             model.quantizer.init_embedding(init='gaussian')
 
-        elif model.hparams.init == 'kmeans':
+        elif model.hparams.init=='kmeans':
             centroid = get_centroid(model, trainset, DEV, cfg)
             model.quantizer.init_embedding(init='kmeans', centroid=centroid)
 
@@ -110,32 +121,38 @@ def main(cfg):
                             device=DEV,
                             save_dir=save_dir,
                             config=cfg,)
-
+    
     trainer.train()
 
 
     if testset is not None:
-        trainer.model.load_state_dict(torch.load(save_dir / 'best_model.pt'))
-        trainer.evaluate(testset, external_dataset=True)
+        try:
+            trainer.model.load_state_dict(torch.load(save_dir/f'best_model.pt'))
+            trainer.evaluate(testset, external_dataset=True)
+        except:
+            assert NotImplementedError('Something is wrong')
 
 
-    if cfg.exp.get('run', False):
+    if cfg.get('exp', False) and cfg.exp.get('run', False):   # post-training experiments only when exp.run=true
         from experiments import run_exp, run_exp_ae
-
+        
+        ae_models = ['Conv1DAE', 'Conv2DAE']
+        vqvae_models = ['Conv1DVQVAE', 'OffsetConv1DVQVAE', 'Conv2DVQVAE', 'OffsetConv2DVQVAE', 'OffsetGrid2DVQVAE', 'Grid2DVQVAE']
+        
         model_name = cfg.model.name
 
-        if model_name == 'Conv1DAE':
+        if model_name in ae_models:
             run_exp_ae(cfg, trainer.model, trainset, testset, save_dir, run=run, device=DEV)
 
-        elif model_name in ('Conv1DVQVAE', 'OffsetConv1DVQVAE'):
-            run_exp(cfg, trainer.model, testset, save_dir, run=run, device=DEV)
+        elif model_name in vqvae_models:
+            run_exp(cfg, trainer.model, testset, save_dir, run=run)
 
         else:
             print(f"[EXP] Unknown model: {model_name}, skipping exp.")
 
 
-    if wandb.run is not None:
+    if wandb.run is not None: 
         wandb.finish()
-
+    
 if __name__ == "__main__":
     main()

@@ -1,4 +1,5 @@
-# The paper's exact train/valid/test split for the released corpus (data=crepe).
+# Artist-level train/valid/test split used for the released (v2) checkpoints. Non-singing clips are marked 'exclude'.
 name: manifest
 params:
-  manifest_pth: splits/inhouse_crepe_split.csv
+  manifest_pth: splits/inhouse_crepe_split_artist.csv
+  with_test: True

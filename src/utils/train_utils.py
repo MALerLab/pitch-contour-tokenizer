@@ -4,6 +4,7 @@ import random
 import numpy as np
 from tqdm import tqdm
 from sklearn.cluster import KMeans
+from threadpoolctl import threadpool_limits
 from omegaconf.dictconfig import DictConfig
 
 import torch
@@ -28,7 +29,6 @@ def get_centroid(model: nn.Module,
                 dataset: Dataset,
                 device: torch.device,
                 cfg: DictConfig) -> torch.Tensor:
-    # Use the trainset's current sampled windows as-is (no resampling).
     dataloader = DataLoader(dataset, batch_size=cfg.train.batch_size, shuffle=False, drop_last=False,
                             num_workers=4, pin_memory=True)
 
@@ -37,19 +37,19 @@ def get_centroid(model: nn.Module,
     model = model.to(device)
     with torch.inference_mode():
         for batch in tqdm(dataloader, desc='Collecting Latent'):
-            x, weight, _ = batch
+            x, weight = batch
             if model.hparams.in_channels == 2:
                 target, pred, _, _ = model(torch.cat([x, weight], dim=-2).to(device, non_blocking=True))
             else:
                 target, pred, _, _ = model(x.to(device, non_blocking=True))
-
             latent.append(target[-1])
 
     latent = torch.cat(latent, dim=0).reshape(-1, model.hparams.latent_dim)
 
     print("Start Clustering")
     kmeans = KMeans(n_clusters=model.quantizer.n_e, random_state=cfg.random_seed)
-    kmeans.fit(latent.detach().cpu().numpy())
+    with threadpool_limits(limits=1):
+        kmeans.fit(latent.detach().cpu().numpy())
 
     centroid = torch.Tensor(kmeans.cluster_centers_)
 

@@ -8,4 +8,4 @@ defaults:
 metric:
 
 exp:
-  n_codes_list: [128, 256, 512]
+  n_codes_list: [256]

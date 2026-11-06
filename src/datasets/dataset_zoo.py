@@ -1,7 +1,6 @@
 import math
 import random
 from pathlib import Path
-from collections import Counter
 from typing import List, Tuple, Dict
 
 import numpy as np
@@ -12,11 +11,10 @@ import torch
 from torch.utils.data import Dataset
 
 class BaseDataset(Dataset):
-    def __init__(self, 
+    def __init__(self,
                  data_pth: str | list,
                  window: int | float,
                  sr: int | float=100,
-                 norm_midi: bool=False,
                  weight: str | List[str] | bool=False,
                  is_valid: bool=False,) -> None:
         super().__init__()
@@ -24,7 +22,7 @@ class BaseDataset(Dataset):
             self.data_dir = sorted(Path(data_pth).rglob('*.csv'))
         elif isinstance(data_pth, list):
             self.data_dir = data_pth
-        
+
         self.weight = weight
         if isinstance(weight, str):
             self.weight_cols = [weight]
@@ -34,21 +32,22 @@ class BaseDataset(Dataset):
             self.weight_cols = []
 
         self.is_valid = is_valid
-        self.norm_midi = norm_midi
 
         self.sr = sr
         self.window = window
 
         self.loaded_data = self._load_data()
+        self.regions = None # v2: region 창 필터 미사용 — 파일 전체를 하나의 구간으로 처리 (sample_receptive_field의 [(0, T)] 경로)
 
 
     def _frequency_to_midi(self, 
                           frequency: float) -> float:
+        # Convert frequency to MIDI note
         return 69 + 12 * math.log2(frequency / 440)
 
 
-    def _get_data(self, 
-                  csv_file: Path) -> Tuple[torch.Tensor, float]:
+    def _get_data(self,
+                  csv_file: Path) -> Tuple[torch.Tensor, torch.Tensor]:
         contour_df = pd.read_csv(csv_file, dtype={'frequency':np.float32})
         frequency = contour_df['frequency'].values
         if self.weight_cols:
@@ -56,27 +55,22 @@ class BaseDataset(Dataset):
         else:
             weight = np.ones((frequency.shape[-1], 1))
 
-        midi = [self._frequency_to_midi(freq) for freq in frequency]
-        if self.norm_midi:
-            tonic = Counter(np.round(midi)).most_common(1)[0][0]
-        else:
-            tonic = 0
-        norm_midi = [(mi-float(tonic))/12 for mi in midi]
+        midi = [self._frequency_to_midi(freq)/12 for freq in frequency] # 1 Octave => 1.0
 
-        norm_midi = torch.tensor(norm_midi, dtype=torch.float32)
+        midi = torch.tensor(midi, dtype=torch.float32)
         weight = torch.tensor(weight.T, dtype=torch.float32)
 
-        return norm_midi, weight, tonic
+        return midi, weight
 
 
-    def _load_data(self) -> List[Tuple[torch.Tensor, float]]:
+    def _load_data(self) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         loaded_data = []
         for csv_file in tqdm(self.data_dir, desc='Load Data'):
-            norm_midi, weight, tonic = self._get_data(csv_file)
-            loaded_data.append((norm_midi, weight, tonic))
-        
+            midi, weight = self._get_data(csv_file)
+            loaded_data.append((midi, weight))
+
         return loaded_data
-    
+
 
     def __len__(self) -> int:
         return len(self.loaded_data)
@@ -89,17 +83,16 @@ class BaseDataset(Dataset):
 
 
 class FullPitchDataset(BaseDataset):
-    def __init__(self, 
+    def __init__(self,
                  data_pth: str | list,
                  window: int,
                  sr: int | float=100,
-                 norm_midi: bool=False,
                  weight: str | List[str] | bool=False,
                  is_valid: bool=False,
                  threshold: None | Dict=None,
                  threshold_q: None | Dict=None,
                  num_interpolate: int=2,) -> None:
-        super().__init__(data_pth, window, sr, norm_midi, weight, is_valid)
+        super().__init__(data_pth, window, sr, weight, is_valid)
         self.threshold = threshold if threshold is not None else {}
         self.threshold_q = threshold_q if threshold_q is not None else {}
         self.num_interpolate = num_interpolate
@@ -142,33 +135,37 @@ class FullPitchDataset(BaseDataset):
         raise NotImplementedError("Subclasses must implement this method")
 
 
-    def get_segment_by_split(self, 
-                             x: torch.Tensor, 
-                             w: torch.Tensor, 
+    def get_segment_by_split(self,
+                             x: torch.Tensor,
+                             w: torch.Tensor,
                              is_filtered: torch.Tensor) -> Tuple[torch.Tensor]:
         x_len = x.shape[-1]
         max_start = x_len - self.window
 
         if self.is_valid:
             n_samples = x_len//self.window
-            x = torch.cat([x[:self.window*n_samples].reshape(n_samples,self.window), x[-self.window:].unsqueeze(0)], dim=0)
-            w = torch.cat([w[...,:self.window*n_samples].reshape(-1,n_samples,self.window).permute(1,0,2), w[...,-self.window:].unsqueeze(0)], dim=0)
-            is_filtered = torch.cat([is_filtered[:self.window*n_samples].reshape(n_samples,self.window), is_filtered[-self.window:].unsqueeze(0)], dim=0)
-            n_samples += 1
+            x_seg = x[:self.window*n_samples].reshape(n_samples, self.window)
+            w_seg = w[..., :self.window*n_samples].reshape(-1, n_samples, self.window).permute(1, 0, 2)
+            f_seg = is_filtered[:self.window*n_samples].reshape(n_samples, self.window)
+            starts = torch.arange(n_samples)*self.window # 나머지 frame은 버림 — 모든 window가 비중첩 stride=window 타일
+            x, w, is_filtered = x_seg, w_seg, f_seg
         else:
             start = random.randint(0, max_start)
             n_samples = (x_len-start)//self.window
             x = x[start:start+self.window*n_samples].reshape(n_samples,self.window)
             w = w[...,start:start+self.window*n_samples].reshape(-1,n_samples,self.window).permute(1,0,2)
             is_filtered = is_filtered[start:start+self.window*n_samples].reshape(n_samples,self.window)
-    
-        return x, w, is_filtered
+            starts = start + torch.arange(n_samples)*self.window
+
+        return x, w, is_filtered, starts
 
 
     def filter_receptive_field(self, 
                               is_filtered: torch.Tensor, 
                               return_ids: bool) -> torch.Tensor:
+        # interpolate 시 만족 가능한 segment일 경우 True
         interpolate_mask = ~(is_filtered.unfold(dimension=-1, step=1, size=self.num_interpolate+1).float().sum(dim=-1) >= self.num_interpolate + 1).sum(dim=-1).bool()
+        # start/end에서 filtered 되지 않을 시 True
         start_end_mask = ~(is_filtered[...,0] | is_filtered[...,-1])
         
         final_mask = interpolate_mask & start_end_mask
@@ -180,15 +177,32 @@ class FullPitchDataset(BaseDataset):
         return final_mask
 
 
+    # def interpolate_filtered_point(self, 
+    #                                x: torch.Tensor, 
+    #                                is_filtered: torch.Tensor) -> torch.Tensor:
+    #     all_idx = np.arange(self.window)
+    #     pitch, is_filtered = x.numpy(), is_filtered.numpy()
+    #     x_out = pitch.copy()
+
+    #     for target_row_idx in np.where(is_filtered.any(axis=-1))[0]:
+    #         valid_idx = np.where(~is_filtered[target_row_idx])[0]
+    #         x_out[target_row_idx] = np.interp(all_idx, valid_idx, pitch[target_row_idx][valid_idx])
+
+    #     return x_out
+
+
     def interpolate_filtered_point(self, 
                                    x: torch.Tensor, 
                                    is_filtered: torch.Tensor) -> torch.Tensor:
+        # x: (N, W) torch.Tensor, is_filtered: (N, W) bool
         n, w = x.shape
         pos = torch.arange(w).expand(n, w)
 
+        # left_idx[i,j] = 위치 j에서 좌측으로 가장 가까운 valid 위치
         left_src  = torch.where(is_filtered, torch.full_like(pos, -1), pos)
         left_idx  = torch.cummax(left_src, dim=-1).values
 
+        # right_idx[i,j] = 위치 j에서 우측으로 가장 가까운 valid 위치
         right_src = torch.where(is_filtered, torch.full_like(pos, w), pos)
         right_idx = torch.flip(torch.cummin(torch.flip(right_src, [-1]), dim=-1).values, [-1])
 
@@ -205,33 +219,35 @@ class FullPitchDataset(BaseDataset):
 
 
     def _cache_filter(self) -> None:
-        self.loaded_data = [(x, w, tonic, self.aggregate_weight_filter(w))
-                            for x, w, tonic in self.loaded_data]
+        self.loaded_data = [(x, w, self.aggregate_weight_filter(w))
+                            for x, w in self.loaded_data]
 
 
-    def sample_receptive_field(self) -> Tuple[torch.Tensor, torch.Tensor, np.ndarray]:
-        sampled_x, sampled_w, sampled_tonic = [], [], []
-        for x, w, tonic, is_filtered_full in self.loaded_data:
-            if x.shape[-1] - self.window < 0:
-                continue
+    def sample_receptive_field(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        sampled_x, sampled_w, sampled_meta = [], [], []
+        for i, (x, w, is_filtered_full) in enumerate(self.loaded_data):
+            regions = self.regions[i] if self.regions is not None else [(0, x.shape[-1])]
+            for s, e in regions:
+                if e - s < self.window:
+                    continue
 
-            x, w, is_filtered = self.get_segment_by_split(x, w, is_filtered_full)
-            final_mask = self.filter_receptive_field(is_filtered, return_ids=False)
+                x_seg, w_seg, is_filtered, starts = self.get_segment_by_split(x[s:e], w[..., s:e], is_filtered_full[s:e])
+                final_mask = self.filter_receptive_field(is_filtered, return_ids=False)
 
-            x = x[final_mask]
-            w = w[final_mask]
-            is_filtered = is_filtered[final_mask]
-            tonic = np.repeat(tonic, x.shape[0])
+                x_seg = x_seg[final_mask]
+                w_seg = w_seg[final_mask]
+                is_filtered = is_filtered[final_mask]
+                starts = starts[final_mask]
 
-            x = self.interpolate_filtered_point(x, is_filtered)
+                x_seg = self.interpolate_filtered_point(x_seg, is_filtered)
 
-            sampled_x.append(x)
-            sampled_w.append(w.numpy())
-            sampled_tonic.append(tonic)
-        
-        sampled_data = (torch.from_numpy(np.concatenate(sampled_x, axis=0)), 
-                        torch.from_numpy(np.concatenate(sampled_w, axis=0)), 
-                        np.concatenate(sampled_tonic, axis=0))
+                sampled_x.append(x_seg)
+                sampled_w.append(is_filtered.numpy()) # weight 자리에 is_filtered (mask 의미론) — 보간으로 채운 frame 표시
+                sampled_meta.append(torch.stack([torch.full_like(starts, i), s + starts], dim=-1))
+
+        self.sampled_meta = torch.cat(sampled_meta, dim=0) # (N, 2) = (data_idx, 원본 frame 축 start)
+        sampled_data = (torch.from_numpy(np.concatenate(sampled_x, axis=0)),
+                        torch.from_numpy(np.concatenate(sampled_w, axis=0)).unsqueeze(-2))
 
         return sampled_data
 
@@ -244,26 +260,25 @@ class FullPitchDataset(BaseDataset):
         return len(self.sampled_data[0])
 
 
-    def __getitem__(self, 
+    def __getitem__(self,
                     idx: int) -> Tuple[torch.Tensor]:
-        x, w, meta = self.sampled_data[0][idx], self.sampled_data[1][idx], self.sampled_data[2][idx]
-        return x.unsqueeze(0), w, meta
+        x, w = self.sampled_data[0][idx], self.sampled_data[1][idx]
+        return x.unsqueeze(-2), w
 
 
 
 
 class FullPitchThresholdDataset(FullPitchDataset):
-    def __init__(self, 
+    def __init__(self,
                  data_pth: str | list,
                  window: int,
                  sr: int | float=100,
-                 norm_midi: bool=False,
                  weight: str | List[str] | bool=False,
                  is_valid: bool=False,
                  threshold: None | Dict=None,
                  threshold_q: None | Dict=None,
                  num_interpolate: int=2,) -> None:
-        super().__init__(data_pth, window, sr, norm_midi, weight, is_valid, threshold, threshold_q, num_interpolate)
+        super().__init__(data_pth, window, sr, weight, is_valid, threshold, threshold_q, num_interpolate)
         self._cache_filter()
         self.sampled_data = self.sample_receptive_field()
 
@@ -276,13 +291,12 @@ class FullPitchThresholdDataset(FullPitchDataset):
 
 
 class NIAFixedClsDataset(BaseDataset):
-    def __init__(self, 
+    def __init__(self,
                  data_pth: str,
-                 data_info: pd.DataFrame, 
+                 data_info: pd.DataFrame,
                  label_map: dict,
                  window: int=128,
                  sr: int | float=100,
-                 norm_midi: bool=False,
                  weight: str | List[str] | bool=False,
                  **kwargs) -> None:
         self.data_dir = Path(data_pth)
@@ -292,7 +306,6 @@ class NIAFixedClsDataset(BaseDataset):
         self.sr = sr
         self.window = window
         self.weight = weight
-        self.norm_midi = norm_midi
 
         if isinstance(weight, str):
             self.weight_cols = [weight]
@@ -319,26 +332,26 @@ class NIAFixedClsDataset(BaseDataset):
                         offset: int,
                         seg_df: pd.DataFrame,
                         total_len: int) -> Tuple[int, int]:
-        need = self.window - (offset - onset)
+        need = self.window - (offset - onset) # 보완해야할 양
 
         prev_rows = seg_df[seg_df['offset']*100 <= onset]
         next_rows = seg_df[seg_df['onset']*100 >= offset]
-        prev_boundary = int(round(prev_rows.iloc[-1]['offset'], 2)*100) if not prev_rows.empty else 0
-        next_boundary = int(round(next_rows.iloc[0]['onset'], 2)*100) if not next_rows.empty else total_len
+        prev_boundary = int(round(prev_rows.iloc[-1]['offset'], 2)*100) if not prev_rows.empty else 0  # 이전 레이블의 offset
+        next_boundary = int(round(next_rows.iloc[0]['onset'], 2)*100) if not next_rows.empty else total_len  # 다음 레이블의 onset
 
-        left_space = onset - prev_boundary
-        right_space = next_boundary - offset
+        left_space = onset - prev_boundary # 이전 label offset 까지의 잔여 길이
+        right_space = next_boundary - offset # 다음 label onset 까지의 잔여 길이
 
-        if left_space + right_space >= need:
-            if left_space >= right_space:
+        if left_space + right_space >= need: # 이전 label offset, 다음 label onset 까지의 영역으로 window를 채울 수 있을 경우
+            if left_space >= right_space: # left_space가 더 많을 경우, 남은 영역은 right_space로 보완
                 l_pad = min(left_space, need)
                 r_pad = need - l_pad
-            else:
+            else: # right_space가 더 많을 경우, 남은 영역은 left_space로 보완
                 r_pad = min(right_space, need)
                 l_pad = need - r_pad
 
-        else:
-            extra = need - (left_space + right_space)
+        else: # 이전 label offset, 다음 label onset 까지의 영역으로 window를 채울 수 없을 경우
+            extra = need - (left_space + right_space) # 잔존 영역을 소진하고도 필요한 양
             l_extra = extra // 2
             r_extra = extra - l_extra
             l_pad = left_space + l_extra
@@ -357,11 +370,11 @@ class NIAFixedClsDataset(BaseDataset):
         return onset, offset
 
 
-    def _load_data(self) -> List[Tuple[torch.Tensor, float]]:
+    def _load_data(self) -> List[Tuple[torch.Tensor, torch.Tensor, str]]:
         self.check_list = []
         loaded_data = []
         for fn in tqdm(self.data_info['filename'].unique().tolist(), desc='Load Data'):
-            x, w, tonic = self._get_data((self.data_dir/fn).with_suffix('.csv'))
+            x, w = self._get_data((self.data_dir/fn).with_suffix('.csv'))
             seg_df = self.data_info[self.data_info['filename']==fn]
             
             for _, row in seg_df.iterrows():
@@ -370,9 +383,9 @@ class NIAFixedClsDataset(BaseDataset):
                 seg_info = []
                 seg_info.extend([fn, label, onset, offset])
 
-                if self.window < seg_len:
+                if self.window < seg_len: # seg_len이 window보다 길 경우 center에서 crop
                     onset, offset = self._crop_segment(onset, offset)
-                elif self.window > seg_len:
+                elif self.window > seg_len: # seg_len이 window보다 부족할 경우
                     onset, offset = self._expand_segment(onset, offset, seg_df, x.shape[-1])
 
                 seg = x[...,onset:offset]
@@ -380,144 +393,7 @@ class NIAFixedClsDataset(BaseDataset):
 
                 seg_info.extend([onset, offset])
                 self.check_list.append(seg_info)
-                loaded_data.append((seg, seg_w, tonic, label))
-        
-        return loaded_data
-
-
-    def __len__(self) -> int:
-        return len(self.loaded_data)
-    
-
-    def __getitem__(self, 
-                    idx: int) -> Tuple[torch.Tensor]:
-        x, w, tonic, label = self.loaded_data[idx]
-        y = torch.tensor(self.label_map[label], dtype=torch.long)
-
-        return x.unsqueeze(0), w, tonic, y
-
-class PansoriDataset(FullPitchDataset):
-    def __init__(self,
-                 data_pth: str,
-                 data_info: pd.DataFrame,
-                 label_type: str,
-                 label_dict: None | dict=None,
-                 window: int=128,
-                 sr: int | float=100,
-                 norm_midi: bool=False,
-                 weight: str | List[str] | bool=False,
-                 is_valid: bool=False,
-                 threshold: None | Dict=None,
-                 threshold_q: None | Dict=None,
-                 num_interpolate: int=2,
-                 num_offset: int=128,
-                 **kwargs) -> None:
-        self.data_dir = Path(data_pth)
-        self.data_info = data_info
-
-        self.sr = sr
-        self.window = window
-        self.weight = weight
-        self.norm_midi = norm_midi
-        self.is_valid = is_valid # 호환용, slide가 결정적이므로 미사용
-        self.num_offset = num_offset
-
-        if isinstance(weight, str):
-            self.weight_cols = [weight]
-        elif hasattr(weight, "__iter__"):
-            self.weight_cols = list(weight)
-        else:
-            self.weight_cols = []
-
-        self.threshold = threshold if threshold is not None else {}
-        self.threshold_q = threshold_q if threshold_q is not None else {}
-        self.num_interpolate = num_interpolate
-        self._validate_threshold_keys()
-
-        self.label_type = label_type
-        if isinstance(label_dict, dict):
-            self.label_map = label_dict
-        else:
-            self.label_map = {l: i for i, l in enumerate(sorted(l for l in data_info[label_type].unique() if l != 'Unknown'))}
-        self.idx2label = {v:k for k,v in self.label_map.items()}
-
-        self.loaded_data = self._load_data()
-
-
-    def aggregate_weight_filter(self,
-                                w: torch.Tensor) -> torch.Tensor:
-        return self._aggregate(w)
-
-
-    def _get_segments(self,
-                      fn: str,
-                      total_len: int) -> List[Tuple[int, int, int, str]]:
-        # (idx, onset_frame, offset_frame, label) 목록 생성
-        seg_df = self.data_info[self.data_info['filename']==fn]
-        if self.label_type == 'label':
-            seg_df = seg_df[seg_df[self.label_type].isin(self.label_map.keys())]
-            return [(idx, int(round(row['onset'],2)*100), int(round(row['offset'],2)*100), row[self.label_type])
-                    for idx, row in seg_df.iterrows()]
-
-        label = seg_df[self.label_type].iloc[0]
-        if label not in self.label_map:
-            return []
-        return [(0, 0, total_len, label)]
-
-
-    def _roll_segment(self,
-                      x: torch.Tensor,
-                      w: torch.Tensor,
-                      is_filtered: torch.Tensor,
-                      onset: int,
-                      offset: int) -> None | Tuple[torch.Tensor, ...]:
-        x_seg, w_seg, f_seg = x[onset:offset], w[...,onset:offset], is_filtered[onset:offset]
-        if x_seg.shape[-1] < self.window:
-            return None
-
-        x_r = x_seg.unfold(dimension=-1, size=self.window, step=self.num_offset)
-        w_r = w_seg.unfold(dimension=-1, size=self.window, step=self.num_offset).permute(1,0,2)
-        f_r = f_seg.unfold(dimension=-1, size=self.window, step=self.num_offset)
-        onset_ids = torch.arange(x_r.shape[0])
-
-        if (x_seg.shape[-1]-self.window) % self.num_offset != 0: # 잔여분은 끝에서 한 window 추가, onset_id=-1로 마킹
-            x_r = torch.cat([x_r, x_seg[-self.window:].unsqueeze(0)])
-            w_r = torch.cat([w_r, w_seg[...,-self.window:].unsqueeze(0)])
-            f_r = torch.cat([f_r, f_seg[-self.window:].unsqueeze(0)])
-            onset_ids = torch.cat([onset_ids, torch.tensor([-1])])
-
-        return x_r, w_r, f_r, onset_ids
-
-
-    def _filter_rolled(self,
-                       x_r: torch.Tensor,
-                       w_r: torch.Tensor,
-                       f_r: torch.Tensor,
-                       onset_ids: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        final_mask = self.filter_receptive_field(f_r, return_ids=False)
-        x_r, w_r, f_r, onset_ids = x_r[final_mask], w_r[final_mask], f_r[final_mask], onset_ids[final_mask]
-        x_r = self.interpolate_filtered_point(x_r, f_r)
-
-        return x_r, w_r, onset_ids
-
-
-    def _load_data(self):
-        loaded_data = []
-        for fn in tqdm(self.data_info['filename'].unique().tolist(), desc='Load Data'):
-            x, w, tonic = self._get_data((self.data_dir/fn).with_suffix('.csv'))
-            is_filtered = self.aggregate_weight_filter(w)
-
-            for idx, onset, offset, label in self._get_segments(fn, x.shape[-1]):
-                rolled = self._roll_segment(x, w, is_filtered, onset, offset)
-                if rolled is None:
-                    continue
-
-                x_r, w_r, onset_ids = self._filter_rolled(*rolled)
-                if x_r.shape[0] == 0:
-                    continue
-
-                loaded_data.extend((seg, seg_w, (tonic, fn, idx, onset, oid.item()), label)
-                                   for seg, seg_w, oid in zip(x_r, w_r, onset_ids))
+                loaded_data.append((seg, seg_w, label))
 
         return loaded_data
 
@@ -528,7 +404,8 @@ class PansoriDataset(FullPitchDataset):
 
     def __getitem__(self,
                     idx: int) -> Tuple[torch.Tensor]:
-        x, w, meta, label = self.loaded_data[idx]
+        x, w, label = self.loaded_data[idx]
         y = torch.tensor(self.label_map[label], dtype=torch.long)
+        # x, weight = x.chunk(chunks=2, dim=0)
 
-        return x.unsqueeze(0), w, meta, y
+        return x.unsqueeze(0), w, y

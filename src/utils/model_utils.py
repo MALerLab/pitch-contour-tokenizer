@@ -1,4 +1,8 @@
-from typing import List
+from math import prod
+from typing import List, Tuple, Dict
+
+import torch
+import torch.nn.functional as F
 from omegaconf.dictconfig import DictConfig
 
 
@@ -45,6 +49,17 @@ def calc_conv_params(hparams: DictConfig,
     pools = prime_factorization(num_layers, receptive_field)
     pools = shrink_to_L(pools, num_layers)
 
+    # if len(pools) > num_layers:
+    #     div = []
+    #     for i in range(len(pools)//num_layers+1):
+    #         div.append(pools[i*num_layers:(i+1)*num_layers])
+    #     div[-1] = div[-1] + [1] * (num_layers - len(div[-1]))
+
+    #     pools = sorted(div[0], reverse=True)
+    #     for pool in div[1:]:
+    #         pools = sorted([t*p for t, p in zip(pools, sorted(pool))], reverse=True)
+
+
     in_channels_ = in_channels
     if hparams.use_gradual_size:
         channels = prime_factorization(num_layers, hidden_dim)
@@ -86,7 +101,3 @@ def calc_conv_params(hparams: DictConfig,
             parameters[-1]['out_channels'] = in_channels
 
     return parameters
-
-
-
-

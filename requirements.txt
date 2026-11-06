@@ -4,7 +4,7 @@ numpy>=1.24
 pandas>=2.0
 scikit-learn>=1.3
 threadpoolctl>=3.0
-umap-learn>=0.5
+umap-learn==0.5.11   # the released AE token space (token_umap.joblib) was fit with this version
 hydra-core>=1.3
 omegaconf>=2.3
 tqdm>=4.65

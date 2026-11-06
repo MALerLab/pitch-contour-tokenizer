@@ -1,5 +1,5 @@
-import csv
 import random
+import unicodedata
 from typing import Tuple
 from pathlib import Path
 
@@ -12,11 +12,11 @@ from datasets import dataset_zoo
 from utils.train_utils import set_seed
 
 class BaseDatasetMaker:
-    def __init__(self, 
+    def __init__(self,
                  config: DictConfig,) -> None:
         set_seed(config.random_seed)
-        self.data_root = Path(config.data.data_pth)
-        self.data_pth = sorted(self.data_root.rglob('*.csv'))
+        self.data_pth = sorted(Path(config.data.data_pth).rglob('*.csv')) # sort before any shuffle (rglob order is filesystem-dependent)
+        self.data_root = config.data.data_pth
 
         self.dataset_class = getattr(dataset_zoo, config.dataset.name)
         self.dataset_params = config.dataset.params
@@ -26,8 +26,7 @@ class BaseDatasetMaker:
 
 
     def _get_random_split(self) -> Tuple[list | None]:
-        # Fixed split, independent of random_seed (so seed sweeps share the same split).
-        rng = random.Random(self.split_params.get('split_seed', 42))
+        rng = random.Random(self.split_params.get('split_seed', 42)) # random_seed와 분리, 고정 split
         rng.shuffle(self.data_pth)
         split_ratio = self.split_params.split_ratio
         n_total = len(self.data_pth)
@@ -44,29 +43,27 @@ class BaseDatasetMaker:
 
 
     def _get_manifest_split(self) -> Tuple[list | None]:
-        # Explicit per-file split (ships the paper's exact split for the released corpus).
-        manifest = {}
-        with open(self.split_params.manifest_pth, newline='') as f:
-            for row in csv.DictReader(f):
-                manifest[row['path']] = row['split']
+        # Explicit per-file split shipped with the repo (`splits/*.csv`, columns: path,artist,split).
+        # split in {train, valid, test, exclude}; paths are relative to data.data_pth. Every file on disk must be listed.
+        split_df = pd.read_csv(self.split_params.manifest_pth)
+        split_map = {unicodedata.normalize('NFC', p): s
+                     for p, s in zip(split_df['path'], split_df['split'])} # NFC: tolerate NFD-normalised filenames
 
-        buckets = {'train': [], 'valid': [], 'test': []}
-        missing = []
-        for p in self.data_pth:
-            rel = str(p.relative_to(self.data_root))
-            if rel in manifest:
-                buckets[manifest[rel]].append(p)
-            else:
-                missing.append(rel)
-        if missing:
-            raise ValueError(
-                f"{len(missing)} files under {self.data_root} are not in the split manifest "
-                f"{self.split_params.manifest_pth} (e.g. {missing[0]}); use split=random for custom data.")
-        matched = sum(len(v) for v in buckets.values())
-        if matched != len(manifest):
-            print(f"[split] warning: manifest lists {len(manifest)} files but only {matched} were found on disk.")
+        splits = {'train': [], 'valid': [], 'test': [], 'exclude': []}
+        for pth in self.data_pth:
+            rel = unicodedata.normalize('NFC', pth.relative_to(self.data_root).as_posix())
+            split = split_map.pop(rel, None)
+            if split is None:
+                raise KeyError(f'file not in split manifest {self.split_params.manifest_pth}: {rel} '
+                               f'(use split=random for custom data)')
+            splits[split].append(pth)
+        if split_map:
+            raise FileNotFoundError(f'{len(split_map)} manifest entries not found on disk, e.g. {sorted(split_map)[:3]}')
+        if splits['exclude']:
+            print(f"[split] {len(splits['exclude'])} files marked 'exclude' in the manifest are skipped.")
 
-        return buckets['train'], buckets['valid'], buckets['test'] or None
+        test_pth = splits['test'] if self.split_params.with_test else None
+        return splits['train'], splits['valid'], test_pth
 
 
     def _get_split(self) -> Tuple[list | None]:
@@ -109,29 +106,28 @@ class ClsDatasetMaker(BaseDatasetMaker):
 
 
     def _get_random_split(self) -> Tuple[list | None]:
-        raise NotImplementedError
-        # indices = list(range(len(self.data_pth)))
-        # random.shuffle(indices)
+        indices = list(range(len(self.data_pth)))
+        random.shuffle(indices)
         
-        # self.data_pth = [self.data_pth[i] for i in indices]
-        # self.label = [self.label[i] for i in indices]
+        self.data_pth = [self.data_pth[i] for i in indices]
+        self.label = [self.label[i] for i in indices]
         
-        # split_ratio = self.split_params.split_ratio
-        # n_total = len(self.data_pth)
+        split_ratio = self.split_params.split_ratio
+        n_total = len(self.data_pth)
 
-        # if self.split_params.with_test:
-        #     n_train, n_valid = int(n_total * split_ratio[0]), int(n_total * split_ratio[1])
-        #     train_pth, valid_pth, test_pth = self.data_pth[:n_train], self.data_pth[n_train:n_train+n_valid], self.data_pth[n_train+n_valid:]
-        #     train_label, valid_label, test_label = self.label[:n_train], self.label[n_train:n_train+n_valid], self.label[n_train+n_valid:]
-        # else:
-        #     n_train = int(n_total * split_ratio[0])
-        #     train_pth, valid_pth = self.data_pth[:n_train], self.data_pth[n_train:]
-        #     train_label, valid_label = self.label[:n_train], self.label[n_train:]
-        #     test_pth, test_label = None, None
+        if self.split_params.with_test:
+            n_train, n_valid = int(n_total * split_ratio[0]), int(n_total * split_ratio[1])
+            train_pth, valid_pth, test_pth = self.data_pth[:n_train], self.data_pth[n_train:n_train+n_valid], self.data_pth[n_train+n_valid:]
+            train_label, valid_label, test_label = self.label[:n_train], self.label[n_train:n_train+n_valid], self.label[n_train+n_valid:]
+        else:
+            n_train = int(n_total * split_ratio[0])
+            train_pth, valid_pth = self.data_pth[:n_train], self.data_pth[n_train:]
+            train_label, valid_label = self.label[:n_train], self.label[n_train:]
+            test_pth, test_label = None, None
         
-        # train_info, valid_info, test_info = (train_pth, train_label), (valid_pth, valid_label), (test_pth, test_label)
+        train_info, valid_info, test_info = (train_pth, train_label), (valid_pth, valid_label), (test_pth, test_label)
 
-        # return train_info, valid_info, test_info
+        return train_info, valid_info, test_info
 
 
     def _get_stratified_split(self) -> Tuple[list | None]:
@@ -148,12 +144,9 @@ class ClsDatasetMaker(BaseDatasetMaker):
 
     def _get_split(self) -> Tuple[list | None]:
         if self.split_mode == 'random':
-            raise NotImplementedError
-            # train_info, valid_info, test_info = self._get_random_split()
-
+            train_info, valid_info, test_info = self._get_random_split()
         elif self.split_mode == 'stratified':
             train_info, valid_info, test_info = self._get_stratified_split()
-
         else:
             raise NotImplementedError
 
