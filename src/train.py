@@ -1,5 +1,3 @@
-import os
-from tqdm import tqdm
 from pathlib import Path
 from datetime import datetime
 
@@ -8,7 +6,6 @@ import wandb
 from omegaconf import OmegaConf
 
 import torch
-import numpy as np
 
 import trainers
 from losses import loss_zoo
@@ -29,7 +26,7 @@ def main(cfg):
     # Setup
     set_seed(cfg.random_seed)
     hparams = cfg.model.params
-    group_name = f"{cfg.model.get('name')}_{cfg.dataset.get('name')}_{cfg.loss.get('name')}__{hparams.get('receptive_field')}_{hparams.get('latent_dim')}_{hparams.get('num_layers')}__{hparams.get('offset_margin')}_{hparams.get('separate')}__{hparams.get('num_codebooks')}_{hparams.get('beta')}"
+    group_name = f"{cfg.model.get('name')}_{cfg.dataset.get('name')}_{cfg.loss.get('name')}__{hparams.get('receptive_field')}_{hparams.get('latent_dim')}_{hparams.get('num_layers')}__{hparams.get('separate')}__{hparams.get('num_codebooks')}_{hparams.get('beta')}"
     run_name = f"{cfg.wandb.get('notes', group_name)}_{T}"
 
     save_dir = Path(f"{cfg.dir.save_dir}/{run_name}")
@@ -82,7 +79,6 @@ def main(cfg):
     model = model_class(hparams)
     model = model.to(DEV)
 
-    # MTG, Hindustani, Silecne processing
     if 'VQ' in model.__class__.__name__:
         if model.hparams.init=='uniform':
             model.quantizer.init_embedding(init='uniform')
@@ -126,18 +122,15 @@ def main(cfg):
 
 
     if testset is not None:
-        try:
-            trainer.model.load_state_dict(torch.load(save_dir/f'best_model.pt'))
-            trainer.evaluate(testset, external_dataset=True)
-        except:
-            assert NotImplementedError('Something is wrong')
+        trainer.model.load_state_dict(torch.load(save_dir / 'best_model.pt'))
+        trainer.evaluate(testset, external_dataset=True)
 
 
     if cfg.get('exp', False) and cfg.exp.get('run', False):   # post-training experiments only when exp.run=true
         from experiments import run_exp, run_exp_ae
         
-        ae_models = ['Conv1DAE', 'Conv2DAE']
-        vqvae_models = ['Conv1DVQVAE', 'OffsetConv1DVQVAE', 'Conv2DVQVAE', 'OffsetConv2DVQVAE', 'OffsetGrid2DVQVAE', 'Grid2DVQVAE']
+        ae_models = ['Conv1DAE']
+        vqvae_models = ['Conv1DVQVAE', 'OffsetConv1DVQVAE']
         
         model_name = cfg.model.name
 

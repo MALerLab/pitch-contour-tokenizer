@@ -37,7 +37,6 @@ class BaseDataset(Dataset):
         self.window = window
 
         self.loaded_data = self._load_data()
-        self.regions = None # v2: region 창 필터 미사용 — 파일 전체를 하나의 구간으로 처리 (sample_receptive_field의 [(0, T)] 경로)
 
 
     def _frequency_to_midi(self, 
@@ -147,17 +146,15 @@ class FullPitchDataset(BaseDataset):
             x_seg = x[:self.window*n_samples].reshape(n_samples, self.window)
             w_seg = w[..., :self.window*n_samples].reshape(-1, n_samples, self.window).permute(1, 0, 2)
             f_seg = is_filtered[:self.window*n_samples].reshape(n_samples, self.window)
-            starts = torch.arange(n_samples)*self.window # 나머지 frame은 버림 — 모든 window가 비중첩 stride=window 타일
-            x, w, is_filtered = x_seg, w_seg, f_seg
+            x, w, is_filtered = x_seg, w_seg, f_seg # 나머지 frame은 버림 — 모든 window가 비중첩 stride=window 타일
         else:
             start = random.randint(0, max_start)
             n_samples = (x_len-start)//self.window
             x = x[start:start+self.window*n_samples].reshape(n_samples,self.window)
             w = w[...,start:start+self.window*n_samples].reshape(-1,n_samples,self.window).permute(1,0,2)
             is_filtered = is_filtered[start:start+self.window*n_samples].reshape(n_samples,self.window)
-            starts = start + torch.arange(n_samples)*self.window
 
-        return x, w, is_filtered, starts
+        return x, w, is_filtered
 
 
     def filter_receptive_field(self, 
@@ -224,28 +221,23 @@ class FullPitchDataset(BaseDataset):
 
 
     def sample_receptive_field(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        sampled_x, sampled_w, sampled_meta = [], [], []
-        for i, (x, w, is_filtered_full) in enumerate(self.loaded_data):
-            regions = self.regions[i] if self.regions is not None else [(0, x.shape[-1])]
-            for s, e in regions:
-                if e - s < self.window:
-                    continue
+        sampled_x, sampled_w = [], []
+        for x, w, is_filtered_full in self.loaded_data:
+            if x.shape[-1] < self.window:
+                continue
 
-                x_seg, w_seg, is_filtered, starts = self.get_segment_by_split(x[s:e], w[..., s:e], is_filtered_full[s:e])
-                final_mask = self.filter_receptive_field(is_filtered, return_ids=False)
+            x_seg, w_seg, is_filtered = self.get_segment_by_split(x, w, is_filtered_full)
+            final_mask = self.filter_receptive_field(is_filtered, return_ids=False)
 
-                x_seg = x_seg[final_mask]
-                w_seg = w_seg[final_mask]
-                is_filtered = is_filtered[final_mask]
-                starts = starts[final_mask]
+            x_seg = x_seg[final_mask]
+            w_seg = w_seg[final_mask]
+            is_filtered = is_filtered[final_mask]
 
-                x_seg = self.interpolate_filtered_point(x_seg, is_filtered)
+            x_seg = self.interpolate_filtered_point(x_seg, is_filtered)
 
-                sampled_x.append(x_seg)
-                sampled_w.append(is_filtered.numpy()) # weight 자리에 is_filtered (mask 의미론) — 보간으로 채운 frame 표시
-                sampled_meta.append(torch.stack([torch.full_like(starts, i), s + starts], dim=-1))
+            sampled_x.append(x_seg)
+            sampled_w.append(is_filtered.numpy()) # weight 자리에 is_filtered (mask 의미론) — 보간으로 채운 frame 표시
 
-        self.sampled_meta = torch.cat(sampled_meta, dim=0) # (N, 2) = (data_idx, 원본 frame 축 start)
         sampled_data = (torch.from_numpy(np.concatenate(sampled_x, axis=0)),
                         torch.from_numpy(np.concatenate(sampled_w, axis=0)).unsqueeze(-2))
 

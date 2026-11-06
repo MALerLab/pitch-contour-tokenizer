@@ -7,7 +7,6 @@ import joblib
 from pathlib import Path
 from omegaconf import DictConfig, OmegaConf
 
-import numpy as np
 from tqdm import tqdm
 from umap import UMAP
 from sklearn.cluster import KMeans
@@ -48,57 +47,49 @@ KR2EN = {'남도 꺾는청': 'nam-kk', '남도요성': 'nam-yo', '서도요성':
 
 
 def _nia_cls_variants(cfg: DictConfig, save_dir: Path) -> list:
-    # (nia, nia_vocal) two tracks; the released code supports FullPitch datasets only (no padded variants)
-    heads = [('NIAFixedClsDataset', 'nia', 'EXP/NIA')]
+    # (nia, nia_vocal) two tracks, both on NIAFixedClsDataset
     variants = []
     for exp_cfg, track_state, track_log, cnt_prefix in [
             (cfg.exp.nia, '', '', ''),
             (cfg.exp.nia_vocal, '/vocal', '/VOCAL', 'VOCAL')]:
-        for ds_name, head_state, head_log in heads:
-            c = OmegaConf.to_container(exp_cfg, resolve=True)
-            c['dataset']['name'] = ds_name
-            variants.append((
-                OmegaConf.create(c),                          # nia_cfg
-                f'{head_state}{track_state}/map',             # state_key
-                f'{head_log}{track_log}',                     # log prefix
-                cnt_prefix,
-            ))                                                # cnt_prefix -> label_token_cnt file suffix (_vocal)
+        c = OmegaConf.to_container(exp_cfg, resolve=True)
+        c['dataset']['name'] = 'NIAFixedClsDataset'
+        variants.append((
+            OmegaConf.create(c),          # nia_cfg
+            f'nia{track_state}/map',      # state_key
+            f'EXP/NIA{track_log}',        # log prefix
+            cnt_prefix,                   # label_token_cnt file suffix (_vocal)
+        ))
     return variants
 
 
 # ---------- 공통 실행 블록 (VQ/AE는 tokenizer만 다름) ----------
 
-def _run_kld_flip(st, suffix, model, tokenizer, testset, meta_fn, n_codes, window, offset,
-                  save_dir, run, contours_fn=None):
-    # suffix: '' (clean segment) | '_pad' (pad 포함 segment) — state key·저장 파일·로그 prefix에 공통 사용
-    kld_key, flip_key = f'kld{suffix}', f'code_flip{suffix}'
-    do_kld, do_flip = st.should(kld_key), st.should(flip_key)
+def _run_kld_flip(st, model, tokenizer, testset, meta_fn, n_codes, window, offset, save_dir, run):
+    do_kld, do_flip = st.should('kld'), st.should('code_flip')
     if not (do_kld or do_flip):
         return
 
     data_ids, start_ids, end_ids, _ = meta_fn()
-    contours = contours_fn() if contours_fn is not None else None
     for end_offset in [window//2 - offset, window - offset]:
         if do_kld:
             get_total_mean_klds(
                 model=model, tokenizer=tokenizer, dataset=testset,
                 data_ids=data_ids, start_ids=start_ids, end_ids=end_ids,
                 n_codes=n_codes, offset=offset, end_offset=end_offset,
-                prefix=f'EXP/KLD{suffix.upper()}', pth=save_dir, run=run,
-                contours=contours, tag=suffix,
+                prefix='EXP/KLD', pth=save_dir, run=run,
             )
         if do_flip:
             get_total_avg_acc(
                 model=model, tokenizer=tokenizer, dataset=testset,
                 data_ids=data_ids, start_ids=start_ids, end_ids=end_ids,
                 offset=offset, end_offset=end_offset,
-                prefix=f'EXP/CODE_FLIP{suffix.upper()}', pth=save_dir, run=run,
-                contours=contours, tag=suffix,
+                prefix='EXP/CODE_FLIP', pth=save_dir, run=run,
             )
     if do_kld:
-        st.done(kld_key)
+        st.done('kld')
     if do_flip:
-        st.done(flip_key)
+        st.done('code_flip')
 
 
 def _run_nia_cls(st, model, tokenizer, n_codes, save_dir, run, variants):
@@ -118,7 +109,6 @@ def _run_nia_cls(st, model, tokenizer, n_codes, save_dir, run, variants):
             num_labels=num_labels, n_codes=n_codes,
             pth=save_dir, prefix=cnt_prefix,
         )
-        P_label_uniform = np.ones(num_labels) / num_labels
 
         best_T = fit_temperature_with_log(
             validset=nvalidset, model=model, tokenizer=tokenizer,
@@ -158,7 +148,7 @@ def run_exp(cfg: DictConfig, model, testset, save_dir: Path, run=None):
                   cfg.exp.get('skip', []), cfg.exp.get('force', False))
 
     # KLD & Code Flip
-    _run_kld_flip(st, '', model, tokenizer, testset, lambda: get_segment_meta(testset),
+    _run_kld_flip(st, model, tokenizer, testset, lambda: get_segment_meta(testset),
                   n_codes, window, offset, save_dir, run)
 
     _run_nia_cls(st, model, tokenizer, n_codes, save_dir, run, _nia_cls_variants(cfg, save_dir))
@@ -272,7 +262,7 @@ def run_exp_ae(cfg: DictConfig, model, trainset, testset, save_dir: Path, run=No
         tokenizer = AETokens(scaler, umap_embed, kmeans)
 
         # KLD & Code Flip
-        _run_kld_flip(st, '', model, tokenizer, testset, lambda: meta,
+        _run_kld_flip(st, model, tokenizer, testset, lambda: meta,
                       n_codes, window, offset, save_dir, new_run)
 
         _run_nia_cls(st, model, tokenizer, n_codes, save_dir, new_run, cls_variants)

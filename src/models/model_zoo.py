@@ -134,9 +134,7 @@ class Conv1DVQVAE(Conv1DAE):
         super().__init__(hparams)
         self.quantizer = VectorQuantizer(n_e=hparams.num_codebooks, 
                                          e_dim=self.latent_dim, 
-                                         beta=hparams.beta, 
-                                         ortho_reg=hparams.get('ortho_reg', 0.0),
-                                         use_simvq=hparams.get('use_simvq', False))
+                                         beta=hparams.beta)
 
 
     def forward(self, 

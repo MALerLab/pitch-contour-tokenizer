@@ -1,8 +1,7 @@
 import warnings
-from typing import Optional, List, Tuple
+from typing import Optional
 
 import torch
-import torchaudio
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import _reduction as _Reduction
@@ -207,16 +206,6 @@ class OffsetMSELoss(MSELoss):
 #         return loss
 
 
-
-
-# ---- OffsetGridCELoss offset별 점수 커널 (track 경로) ----
-# 입력 팩: OffsetGrid2DVQVAE.decode 반환값 (grid_variants, mask_variants, meta)
-#   grid_variants[t]: (batch, 1, n_freq, n_variant, track_len_t) — tempo 트랙 t의 freq-bin logits,
-#                     n_variant = n_y·n_z (y-major·zoom-minor)
-#   mask_variants[t]: (batch, 1, track_len_t) — mask(unvoiced) logit, 트랙 내 변형 간 공유
-#   meta: {step, rf, n_windows, n_zoom, n_y} — 트랙 t의 창 수 = (track_len_t − rf)//step + 1
-# grid_target: (batch, 1, n_freq, rf) — to_grid one-hot, unvoiced 프레임은 all-zero
-# 출력 점수: (batch, 1, n_offset) — flat offset 순서는 y > zoom > tempo·window
 
 
 class VectorQuantizeLoss(nn.Module):

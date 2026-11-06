@@ -1,10 +1,8 @@
-from typing import Tuple, Union
+from typing import Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from omegaconf.dictconfig import DictConfig
-from omegaconf.listconfig import ListConfig
 
 from utils.model_utils import calc_conv_params
 from losses.loss_zoo import VectorQuantizeLoss
@@ -168,9 +166,7 @@ class VectorQuantizer(nn.Module):
     def __init__(self, 
                  n_e: int, 
                  e_dim: int, 
-                 beta: float,
-                 ortho_reg: float=0.0,
-                 use_simvq: bool=False) -> None:
+                 beta: float) -> None:
         super().__init__()
         self.n_e = n_e
         self.e_dim = e_dim
@@ -178,25 +174,15 @@ class VectorQuantizer(nn.Module):
         self.embedding = nn.Embedding(n_e, e_dim)
         self.vq_loss = VectorQuantizeLoss(beta)
 
-        self.ortho_reg = ortho_reg
-
-        self.use_simvq = use_simvq
-        if self.use_simvq:
-            self.embedding_proj = nn.Linear(e_dim, e_dim)    # learnable transform
-
 
     def init_embedding(self, 
                        init: str,
                        centroid: torch.Tensor | None=None):
         if init=='uniform':
             self.embedding.weight.data.uniform_(-1/self.n_e, 1/self.n_e) # n_e,e_dim
-            if self.use_simvq:
-                self.embedding.weight.requires_grad = False      # frozen anchor
 
         elif init=='gaussian':
             self.embedding.weight.data.normal_(mean=0.0, std=self.e_dim**-0.5) # n_e,e_dim
-            if self.use_simvq:
-                self.embedding.weight.requires_grad = False      # frozen anchor
 
         elif init=='kmeans' and centroid is not None:
             self.embedding.weight.data = centroid.to(self.embedding.weight.device)
@@ -205,28 +191,10 @@ class VectorQuantizer(nn.Module):
             raise Exception("init must be 'uniform', 'gaussian' or 'kmeans'")
 
 
-    def get_codebook(self):
-        if self.use_simvq:
-            codebook = self.embedding_proj(self.embedding.weight)
-        else:
-            codebook = self.embedding.weight
-
-        return codebook
-
-
-    def orthogonal_loss_fn(self, 
-                           codebook:torch.Tensor) -> torch.Tensor:
-        # codebook: (n_e, e_dim)
-        normed = F.normalize(codebook, p=2, dim=-1, eps=1e-12)  # (n_e, e_dim)
-        cosine_sim = torch.einsum('i d, j d -> i j', normed, normed)  # (n_e, n_e)
-
-        return (cosine_sim ** 2).sum() / (self.n_e ** 2) - (1 / self.n_e)
-
-
     def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor]:
         z_flatten = z.contiguous().view(-1, self.e_dim) if z.ndim != 2 else z # b*tcomp,e_dim(c)
 
-        codebook = self.get_codebook()
+        codebook = self.embedding.weight
 
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
         z_sq = torch.sum(z_flatten**2, dim=-1, keepdim=True)
@@ -244,10 +212,6 @@ class VectorQuantizer(nn.Module):
 
         loss, codebook_loss, commitment_loss = self.vq_loss(z, z_q)
 
-        ortho_loss = None
-        if self.ortho_reg:
-            ortho_loss = self.orthogonal_loss_fn(codebook)
-        
         z_q = z + (z_q - z).detach()
 
-        return z_q, (loss, codebook_loss, commitment_loss, ortho_loss), min_e
+        return z_q, (loss, codebook_loss, commitment_loss), min_e

@@ -16,4 +16,3 @@ params:
   num_codebooks: 256
   beta: 2.0
   init: kmeans
-  ortho_reg: 0.0

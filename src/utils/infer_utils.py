@@ -1,20 +1,10 @@
 from models import model_zoo
-from datasets import dataset_zoo
 
 import torch
-import torchaudio
 import torch.nn as nn
-from torch.utils.data import DataLoader
-
-import os
-from pathlib import Path
-from typing import Tuple, List
-from collections import defaultdict
 
 import numpy as np
-from tqdm import tqdm
 from omegaconf import OmegaConf
-from omegaconf.dictconfig import DictConfig
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 
 import matplotlib.pyplot as plt
@@ -79,8 +69,7 @@ def get_selected_offset(idx, rf, offset_params):
 
 
 def extract_min_e(model, x):
-    # grid 모델은 decode 생략 경량 경로(encode_tokens), 그 외는 기존 full forward의 min_e
-    return model.encode_tokens(x) if hasattr(model, 'encode_tokens') else model(x)[-1]
+    return model(x)[-1]
 
 
 def visualize_kld_from_baseline(kld_dict, baseline):

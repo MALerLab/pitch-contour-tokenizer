@@ -20,9 +20,8 @@ import matplotlib.pyplot as plt
 
 class VQTokens:
     batch_size = 256   # NIA DataLoader
-    file_tag = ''      # 저장 파일명 suffix (code_flip{file_tag}{tag}.npy 등)
-    chunk = 1024       # pad segment는 분 단위 길이가 가능하므로 chunk 순회 (예제별 독립 forward라 결과는 단일 forward와 동일)
-                       # grid 계열은 to_grid (b,1,F,rf) → 2D conv activation이 커서 8192면 OOM (max_pool2d 한 층 4.5GiB)
+    file_tag = ''      # 저장 파일명 suffix (code_flip{file_tag}.npy 등)
+    chunk = 1024       # long segments are encoded in chunks (per-example forward, same result as a single forward)
 
     def encode_batch(self, model, x):
         # 배치 → 코드 id (np). x는 caller가 device로 옮겨서 전달
@@ -131,13 +130,13 @@ def get_segment_meta(dataset, dur=None):
     return data_ids, start_ids, end_ids, durations
 
 
-def get_segments(dataset, data_ids, start_ids, end_ids, idx, offset, end_offset=None, contours=None):
+def get_segments(dataset, data_ids, start_ids, end_ids, idx, offset, end_offset=None):
     offset_cnt = dataset.window // offset if end_offset is None else end_offset // offset + 1
     start_idx, end_idx = start_ids[idx], end_ids[idx]
     valid_len = end_idx - start_idx - dataset.window + offset if end_offset is None else end_idx - start_idx - end_offset
     segment_len = valid_len // dataset.window * dataset.window
     required_len = segment_len + (offset_cnt - 1) * offset
-    x = contours[data_ids[idx]] if contours is not None else dataset.loaded_data[data_ids[idx]][0]
+    x = dataset.loaded_data[data_ids[idx]][0]
     x = x[start_idx:start_idx + required_len]
     segments = torch.stack([x[i * offset:i * offset + segment_len].reshape(-1, dataset.window) for i in range(offset_cnt)])
     return segments
@@ -157,14 +156,14 @@ def get_acc(inference_output, offset, window=128):
 
 
 def get_total_avg_acc(model, tokenizer, dataset, data_ids, start_ids, end_ids, offset, end_offset,
-                      device='cuda', prefix='test', run=None, pth=None, contours=None, tag=''):
-    segments = (get_segments(dataset, data_ids, start_ids, end_ids, idx, offset, end_offset, contours=contours)
+                      device='cuda', prefix='test', run=None, pth=None):
+    segments = (get_segments(dataset, data_ids, start_ids, end_ids, idx, offset, end_offset)
                 for idx in range(len(data_ids)))
     total_avg_acc = np.array([get_acc(ids, offset).mean()
                               for ids in tokenizer.encode_segments(model, segments, len(data_ids), device)])
 
     if pth is not None:
-        np.save(f"{pth}/code_flip{tokenizer.file_tag}{tag}.npy", total_avg_acc)
+        np.save(f"{pth}/code_flip{tokenizer.file_tag}.npy", total_avg_acc)
 
     _log({f'{prefix}/code_flip_acc/{offset}-{end_offset}': np.mean(total_avg_acc)}, run)
     return total_avg_acc
@@ -210,8 +209,8 @@ def get_mean_kld(kld_dict):
 
 
 def get_total_mean_klds(model, tokenizer, dataset, data_ids, start_ids, end_ids, n_codes, offset, end_offset,
-                        device='cuda', prefix='test', run=None, pth=None, contours=None, tag=''):
-    segments = (get_segments(dataset, data_ids, start_ids, end_ids, i, offset, end_offset, contours=contours)
+                        device='cuda', prefix='test', run=None, pth=None):
+    segments = (get_segments(dataset, data_ids, start_ids, end_ids, i, offset, end_offset)
                 for i in range(len(data_ids)))
     mean_klds = {}
     for i, ids in enumerate(tokenizer.encode_segments(model, segments, len(data_ids), device)):
@@ -219,7 +218,7 @@ def get_total_mean_klds(model, tokenizer, dataset, data_ids, start_ids, end_ids,
         mean_klds[i] = get_mean_kld(kld_dict)
 
     if pth is not None:
-        np.save(f"{pth}/kld{tokenizer.file_tag}{tag}.npy", mean_klds)
+        np.save(f"{pth}/kld{tokenizer.file_tag}.npy", mean_klds)
 
     _log({f'{prefix}/kld/{offset}-{end_offset}': np.mean(sorted(mean_klds.values()))}, run)
 
@@ -241,7 +240,7 @@ def compute_label_token_cnt(trainset, model, tokenizer, num_labels, n_codes, pth
     P_label = label_token_cnt.sum(axis=-1) / label_token_cnt.sum()
 
     if pth is not None:
-        suffix = ('_pad' if 'PAD' in prefix else '') + ('_vocal' if 'VOCAL' in prefix else '')
+        suffix = '_vocal' if 'VOCAL' in prefix else ''
         torch.save(label_token_cnt, f'{pth}/label_token_cnt{tokenizer.file_tag}{suffix}.pt')
 
     return label_token_cnt, P_token_given_label, P_label

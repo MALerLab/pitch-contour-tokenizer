@@ -4,7 +4,6 @@ from pathlib import Path
 import wandb
 from tqdm import tqdm
 from omegaconf.dictconfig import DictConfig
-from omegaconf.listconfig import ListConfig
 
 import torch
 import torch.nn as nn
@@ -16,11 +15,8 @@ from io import BytesIO
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix
 
-from metrics.metric_zoo import *
-from datasets.dataset_zoo import *
-from utils.infer_utils import get_model, get_min_offset_contour
+from utils.infer_utils import get_min_offset_contour
 
 
 class BaseTrainer:
@@ -102,9 +98,7 @@ class AETrainer(BaseTrainer):
     def get_plot_image(self, b_idx, target_contour, pred_contour, z, target_mask=None):
         title = f'Step {self.global_step}'
 
-        vq = False
         if 'VQ' in self.model.__class__.__name__:
-            vq = True
             title += f', # of Codebooks {self.model.quantizer.n_e}, Codebook Dim {self.model.quantizer.e_dim}, $\\beta$={self.model.quantizer.vq_loss.beta}'
             z, zq = z
 
@@ -210,21 +204,6 @@ class AETrainer(BaseTrainer):
             self.recorder[f'{phase}'][f'{phase}/{metric_name}'] = metric_value.item()
 
 
-    def _calc_additive_loss(self,
-                            target: torch.Tensor,
-                            pred: torch.Tensor,
-                            loss: torch.Tensor,
-                            phase: str='Train') -> torch.Tensor:
-        target_contour, pred_contour = target, pred
-
-        if self.config.train.additive_loss.perceptual.get('weight', False):
-            perceptual_loss = self.calc_perceptual_loss(target_contour, pred_contour)
-            self.recorder[f'{phase}'][f'{phase}/PerceptualLoss'] = perceptual_loss.item()
-            loss += self.config.train.additive_loss.perceptual.weight * perceptual_loss
-
-        return loss
-
-
     def _step_multi_channel_batch(self):
         raise NotImplementedError("Subclasses must implement this method")
 
@@ -253,8 +232,6 @@ class AETrainer(BaseTrainer):
             target, pred, loss = self._step_multi_channel_batch(x, weight, phase='Train')
         else:
             target, pred, loss = self._step_single_channel_batch(x, weight, phase='Train')
-
-        loss = self._calc_additive_loss(target, pred, loss, phase='Train')
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -313,7 +290,6 @@ class AETrainer(BaseTrainer):
             #                          num_workers=4, pin_memory=True)
 
         total_loss, total_recon_loss = 0, 0
-        total_perceptual_loss = 0 if self.config.train.additive_loss.perceptual.get('weight', False) else None
         total_metrics = [0 for _ in range(len(self.metric))] if self.metric else None
 
         with torch.inference_mode():
@@ -327,14 +303,10 @@ class AETrainer(BaseTrainer):
                 else:
                     target, pred, loss = self._step_single_channel_batch(x, weight, phase=phase)
 
-                loss = self._calc_additive_loss(target, pred, loss, phase='Valid')
                 self._calc_metric(target, pred, phase=phase)
 
                 total_loss += loss.item() * x.shape[0]
                 total_recon_loss += self.recorder[f'{phase}'][f'{phase}/ReconLoss'] * x.shape[0]
-
-                if total_perceptual_loss is not None:
-                    total_perceptual_loss += self.recorder[f'{phase}'][f'{phase}/PerceptualLoss'] * x.shape[0]
 
                 if total_metrics is not None:
                     for i, m in enumerate(self.metric):
@@ -342,9 +314,6 @@ class AETrainer(BaseTrainer):
 
         self.recorder[f'{phase}'][f'{phase}/Loss'] = total_loss / len(dataset)
         self.recorder[f'{phase}'][f'{phase}/ReconLoss'] = total_recon_loss / len(dataset)
-
-        if total_perceptual_loss is not None:
-            self.recorder[f'{phase}'][f'{phase}/PerceptualLoss'] = total_perceptual_loss / len(dataset)
 
         if total_metrics is not None:
             for i, m in enumerate(self.metric):
@@ -388,9 +357,7 @@ class VQTrainer(BaseTrainer):
     def get_plot_image(self, b_idx, target_contour, pred_contour, z, target_mask=None):
         title = f'Step {self.global_step}'
 
-        vq = False
         if 'VQ' in self.model.__class__.__name__:
-            vq = True
             title += f', # of Codebooks {self.model.quantizer.n_e}, Codebook Dim {self.model.quantizer.e_dim}, $\\beta$={self.model.quantizer.vq_loss.beta}'
             z, zq = z
 
@@ -495,51 +462,6 @@ class VQTrainer(BaseTrainer):
             self.recorder[f'{phase}'][f'{phase}/{metric_name}'] = metric_value.item()
 
 
-    def calc_perceptual_loss(self, 
-                            target_contour: torch.Tensor, 
-                            pred_contour: torch.Tensor) -> torch.Tensor:
-        perceptual_loss = 0
-
-        if getattr(self, 'classifier', None) is None:
-            self.classifier = get_model(self.config.train.perceptual_loss.pretrained_classifier).to(self.device)
-            self.classifier.return_latent = self.config.train.perceptual_loss.return_latent
-
-        self.classifier.eval()
-        with torch.inference_mode():
-            try:
-                if self.model.hparams.in_channels == 2:
-                    _, target_embed = self.classifier(target_contour[:,0].unsqueeze(-2).to(self.device))
-                    _, pred_embed = self.classifier(pred_contour[:,0].unsqueeze(-2).to(self.device))
-                else:
-                    _, target_embed = self.classifier(target_contour.to(self.device))
-                    _, pred_embed = self.classifier(pred_contour.to(self.device))
-            except:
-                raise ValueError(f"Unknown return_latent: {self.classifier.return_latent}")
-
-        if isinstance(self.classifier.return_latent, (list, ListConfig)):
-            perceptual_loss = sum([self.criterion(pred_e, target_e, weight=None) for pred_e, target_e in zip(pred_embed, target_embed)])
-
-        elif isinstance(self.classifier.return_latent, int):
-            perceptual_loss = self.criterion(pred_embed, target_embed, weight=None)
-
-        return perceptual_loss
-
-
-    def _calc_additive_loss(self,
-                            target: torch.Tensor,
-                            pred: torch.Tensor,
-                            loss: torch.Tensor,
-                            phase: str='Train') -> torch.Tensor:
-        target_contour, pred_contour = target[0], pred[0]
-
-        if self.config.train.additive_loss.perceptual.get('weight', False):
-            perceptual_loss = self.calc_perceptual_loss(target_contour, pred_contour)
-            self.recorder[f'{phase}'][f'{phase}/PerceptualLoss'] = perceptual_loss.item()
-            loss += self.config.train.additive_loss.perceptual.weight * perceptual_loss
-
-        return loss
-
-
     def _step_multi_channel_batch(self,
                                     x: torch.Tensor,
                                     weight: torch.Tensor,
@@ -551,18 +473,14 @@ class VQTrainer(BaseTrainer):
                                     x: torch.Tensor,
                                     weight: torch.Tensor,
                                     phase: str='Train') -> Tuple[torch.Tensor]:
-            target, pred, (vq_loss, _, _, ortho_loss), min_e = self.model(x) if not self.criterion.use_weight else self.model(x, mask=weight)
+            target, pred, (vq_loss, _, _), min_e = self.model(x) if not self.criterion.use_weight else self.model(x, mask=weight)
             recon_loss = self.criterion(pred, target, weight=weight)
             loss = recon_loss + vq_loss
-            if ortho_loss is not None:
-                loss += self.model.quantizer.ortho_reg * ortho_loss
 
             out = target, pred, min_e, loss
             
             self.recorder[f'{phase}'][f'{phase}/ReconLoss'] = recon_loss.item()
             self.recorder[f'{phase}'][f'{phase}/VQLoss'] = vq_loss.item()
-            if ortho_loss is not None:
-                self.recorder[f'{phase}'][f'{phase}/OrthoLoss'] = ortho_loss.item()
 
             return out
 
@@ -579,8 +497,6 @@ class VQTrainer(BaseTrainer):
                 target, pred, min_e, loss = self._step_multi_channel_batch(x, weight, phase='Train')
             else:
                 target, pred, min_e, loss = self._step_single_channel_batch(x, weight, phase='Train')
-
-            loss = self._calc_additive_loss(target, pred, loss, phase='Train')
 
         (loss / self.accum_steps).backward()        # backward는 autocast 밖 (bf16: GradScaler 불필요)
         self._micro += 1
@@ -648,8 +564,6 @@ class VQTrainer(BaseTrainer):
         data_loader = DataLoader(dataset, batch_size=eval_bs, shuffle=False)
 
         total_loss, total_vq_loss, total_recon_loss = 0, 0, 0
-        total_ortho_loss = 0 if self.model.quantizer.ortho_reg else None
-        total_perceptual_loss = 0 if self.config.train.additive_loss.perceptual.get('weight', False) else None
         total_metrics = [0 for _ in range(len(self.metric))]
 
         with torch.inference_mode():
@@ -663,18 +577,11 @@ class VQTrainer(BaseTrainer):
                 else:
                     target, pred, min_e, loss = self._step_single_channel_batch(x, weight, phase=phase)
 
-                loss = self._calc_additive_loss(target, pred, loss, phase='Valid')
                 self._calc_metric(target, pred, min_e, phase=phase)
 
                 total_loss += loss.item() * x.shape[0]
                 total_vq_loss += self.recorder[f'{phase}'][f'{phase}/VQLoss'] * x.shape[0]
                 total_recon_loss += self.recorder[f'{phase}'][f'{phase}/ReconLoss'] * x.shape[0]
-
-                if total_ortho_loss is not None:
-                    total_ortho_loss += self.recorder[f'{phase}'][f'{phase}/OrthoLoss'] * x.shape[0]
-
-                if total_perceptual_loss is not None:
-                    total_perceptual_loss += self.recorder[f'{phase}'][f'{phase}/PerceptualLoss'] * x.shape[0]
 
                 for i, m in enumerate(self.metric):
                     total_metrics[i] += self.recorder[f'{phase}'][f'{phase}/{m.__class__.__name__}'] * x.shape[0]
@@ -682,12 +589,6 @@ class VQTrainer(BaseTrainer):
         self.recorder[f'{phase}'][f'{phase}/Loss'] = total_loss / len(dataset)
         self.recorder[f'{phase}'][f'{phase}/VQLoss'] = total_vq_loss / len(dataset)
         self.recorder[f'{phase}'][f'{phase}/ReconLoss'] = total_recon_loss / len(dataset)
-
-        if total_ortho_loss is not None:
-            self.recorder[f'{phase}'][f'{phase}/OrthoLoss'] = total_ortho_loss / len(dataset)
-
-        if total_perceptual_loss is not None:
-            self.recorder[f'{phase}'][f'{phase}/PerceptualLoss'] = total_perceptual_loss / len(dataset)
 
         for i, m in enumerate(self.metric):
             self.recorder[f'{phase}'][f'{phase}/{m.__class__.__name__}'] = total_metrics[i] / len(dataset)
